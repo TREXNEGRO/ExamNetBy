@@ -1,0 +1,94 @@
+stages:
+  - test
+  - sast
+  - sca
+  - secrets
+  - sbom
+  - build
+  - dast
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  CI_REGISTRY_IMAGE: registry.gitlab.com/trexnegro/backend
+
+before_script:
+  - echo "Inicializando pipeline para TREXNEGRO"
+  - apt-get update -yqq && apt-get install -yqq curl unzip git
+
+# Escaneo de secretos con Gitleaks
+secrets_scan:
+  stage: secrets
+  image: zricethezav/gitleaks:latest
+  script:
+    - gitleaks detect --source=. --report-path=gitleaks-report.json || true
+  artifacts:
+    paths:
+      - gitleaks-report.json
+
+# Análisis estático de código (SAST)
+sast_scan:
+  stage: sast
+  image: returntocorp/semgrep
+  script:
+    - semgrep --config=auto --json > semgrep-report.json || true
+  artifacts:
+    paths:
+      - semgrep-report.json
+
+# Escaneo de vulnerabilidades en dependencias (SCA)
+sca_scan:
+  stage: sca
+  image: aquasec/trivy:latest
+  script:
+    - trivy fs --exit-code 0 --format json --output trivy-report.json .
+  artifacts:
+    paths:
+      - trivy-report.json
+
+# Generación del SBOM
+sbom:
+  stage: sbom
+  image: anchore/syft:latest
+  script:
+    - syft dir:. -o json > sbom-report.json
+  artifacts:
+    paths:
+      - sbom-report.json
+
+# DAST con OWASP ZAP (requiere entorno ya desplegado)
+dast_scan:
+  stage: dast
+  image: owasp/zap2docker-stable
+  script:
+    - zap-baseline.py -t http://web:8080 -r zap-report.html || true
+  dependencies:
+    - deploy
+  artifacts:
+    paths:
+      - zap-report.html
+
+# Build de la aplicación
+build_app:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:latest .
+    - docker push $CI_REGISTRY_IMAGE:latest
+
+# Validaciones finales de seguridad
+validate_before_deploy:
+  stage: build
+  script:
+    - echo "Validando reportes..."
+    - if grep -iq 'CRITICAL' trivy-report.json; then echo "Vulnerabilidades críticas detectadas, abortando."; exit 1; fi
+    - echo "Validación completa. OK para desplegar."
+
+# Despliegue en entorno de staging
+deploy:
+  stage: deploy
+  image: docker/compose:alpine
+  script:
+    - docker-compose -f docker-compose.yml up -d --build

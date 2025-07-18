@@ -1,0 +1,84 @@
+# .gitlab-ci.yml
+stages:
+  - sast
+  - sca
+  - secrets
+  - sbom
+  - build
+  - deploy
+  - dast
+
+# i. SAST: Análisis Estático de Seguridad del Código Fuente
+sast:
+  stage: sast
+  image: docker.io/sonarsource/sonar-scanner-cli:latest
+  script:
+    - sonar-scanner -Dsonar.projectKey=TREXNEGRO_PROJECT \
+                    -Dsonar.sources=. \
+                    -Dsonar.host.url=https://sonarqube.trexnegro.com \
+                    -Dsonar.login=$SONAR_TOKEN
+  allow_failure: false
+  only:
+    - main
+
+# ii. SCA: Análisis de Composición de Software para dependencias
+sca:
+  stage: sca
+  image: docker.io/anchore/scan-cli:latest
+  script:
+    - anchore-cli --version
+    - anchore-cli analyze ./app/Dockerfile
+    - anchore-cli evaluate ./app/Dockerfile --fail-policy high
+  allow_failure: false
+
+# v. Gestión de Secretos: detección de secretos expuestos
+secrets_scan:
+  stage: secrets
+  image: gittools/git-secrets
+  script:
+    - git secrets --scan -r
+  allow_failure: false
+
+# iv. SBOM: Generación de Software Bill of Materials
+generate_sbom:
+  stage: sbom
+  image: cyclonedx/cyclonedx-cli:latest
+  script:
+    - cyclonedx-py -i requirements.txt -o sbom.json -j
+  artifacts:
+    paths:
+      - sbom.json
+  allow_failure: false
+
+# Compilación de la aplicación (Build)
+build_app:
+  stage: build
+  image: python:3.11
+  script:
+    - pip install -r requirements.txt
+    - python setup.py install
+  allow_failure: false
+
+# vi. Validación de despliegue según criticidad
+deploy:
+  stage: deploy
+  script:
+    - echo "Validando criticidad..."
+    - if grep -q '"severity":"Critical"' ./sca-results.json; then echo "Build fallido por vulnerabilidades críticas"; exit 1; fi
+    - echo "Desplegando aplicación en ambiente staging..."
+    - ./scripts/deploy.sh staging
+  environment:
+    name: staging
+  only:
+    - main
+
+# iii. DAST: Análisis dinámico de la aplicación ya desplegada
+dast:
+  stage: dast
+  image: owasp/zap2docker-stable
+  script:
+    - zap-baseline.py -t http://staging.trexnegro.com -r zap-report.html
+  artifacts:
+    paths:
+      - zap-report.html
+  allow_failure: false
